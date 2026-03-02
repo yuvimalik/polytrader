@@ -62,3 +62,13 @@ Every round-trip (entry + its exit) has a unique **trade_id** (12-char hex). It 
 - To see a full trade: `rg "trade_id\":\"<id>" trades.jsonl` (or search in a text editor).
 - To list resolutions: `rg "EXIT_RESOLUTION" trades.jsonl` and inspect `resolution_outcome` and `resolution_won` for each line.
 - When a position resolves (price goes to 0 or 1), the exit row has `action=EXIT_RESOLUTION`, `resolution_outcome` = winning market outcome, and `resolution_won` = whether our side won, so you can reconcile every resolution with the same `trade_id` as the ENTRY.
+
+## Loss timing diagnostics
+
+When a trade is logged as a loss (`STOP_LOSS_TRIGGER` or `RESOLUTION_LOSS`), the bot now prints a timestamped **LOSS POST-MORTEM** block in `polytrader.log` and stdout that includes:
+
+- Entry timestamp (`entry_ts`)
+- First/last snapshot timestamps while monitoring the position
+- Total hold duration and monitor-window duration
+- T-minus progression (`entry T-...s -> loss T-...s`) to show how close to resolution the loss occurred
+- Snapshot-by-snapshot timeline with UTC timestamp, bid, and depth
