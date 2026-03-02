@@ -1587,8 +1587,6 @@ async def _run_one_cycle(
                 up_bid, down_bid, up_depth, down_depth, secs, config, engine,
             )
             logger.info(tick_line)
-            if notifier:
-                await notifier.notify_tick(tick_line)
 
             # Entry check in far zone
             if not engine.has_position:
@@ -1684,8 +1682,6 @@ async def _run_one_cycle(
             up_bid, down_bid, up_depth, down_depth, secs, config, engine,
         )
         logger.info(tick_line)
-        if notifier:
-            await notifier.notify_tick(tick_line)
 
         # --- Entry logic (threshold met, no existing position) ---
         if not engine.has_position:
@@ -1771,10 +1767,6 @@ async def main_loop(config: Config, logger: logging.Logger) -> None:
         logger.info("Slack notifications enabled")
     else:
         logger.info("Slack notifications disabled (no SLACK_WEBHOOK_URL)")
-    if notifier.tick_enabled:
-        logger.info("Slack tick updates enabled")
-    else:
-        logger.info("Slack tick updates disabled (no SLACK_TICK_WEBHOOK_URL)")
 
     # Start hourly/24h P/L summary task (sends to Slack when webhook configured)
     summary_task = asyncio.create_task(
