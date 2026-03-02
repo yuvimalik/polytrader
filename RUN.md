@@ -72,3 +72,21 @@ When a trade is logged as a loss (`STOP_LOSS_TRIGGER` or `RESOLUTION_LOSS`), the
 - Total hold duration and monitor-window duration
 - T-minus progression (`entry T-...s -> loss T-...s`) to show how close to resolution the loss occurred
 - Snapshot-by-snapshot timeline with UTC timestamp, bid, and depth
+
+## Stop-loss timeframe analysis (most common SL windows)
+
+To see where stop-losses happen most often, run:
+
+```powershell
+python3 analyze_stop_loss_timeframes.py --file trades.jsonl --bucket-secs 60 --top 10
+```
+
+Useful variants:
+
+```powershell
+# Last 24 hours only
+python3 analyze_stop_loss_timeframes.py --file trades.jsonl --last-hours 24
+
+# Finer-grained windows (30-second buckets)
+python3 analyze_stop_loss_timeframes.py --file trades.jsonl --bucket-secs 30 --top 20
+```
