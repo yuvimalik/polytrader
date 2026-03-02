@@ -1259,44 +1259,78 @@ async def _interruptible_sleep(seconds: float, event: asyncio.Event) -> None:
         pass
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    mins, secs = divmod(total, 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{hours}h{mins:02d}m{secs:02d}s"
+    if mins > 0:
+        return f"{mins}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def _log_loss_postmortem(
     logger: logging.Logger,
     position: "Position",
-    price_snapshots: list,
+    price_snapshots: list[tuple[datetime, float, float, float]],
+    loss_reason: str = "LOSS",
     notifier: Optional["SlackNotifier"] = None,
 ) -> None:
     """Log a price-movement post-mortem when a trade resolves as a loss."""
     entry = position.entry_price
     if not price_snapshots:
         logger.warning(
-            f"LOSS POST-MORTEM | {position.side} entry={entry:.4f} | no price history recorded"
+            "LOSS POST-MORTEM "
+            f"[{loss_reason}] | trade_id={position.trade_id} | {position.side} entry={entry:.4f} "
+            f"| entry_ts={position.entry_time.isoformat()} | no price history recorded"
         )
         return
 
     # Summarise the price journey
-    first_secs, first_bid, first_depth = price_snapshots[0]
-    last_secs, last_bid, last_depth = price_snapshots[-1]
-    peak_bid = max(s[1] for s in price_snapshots)
-    trough_bid = min(s[1] for s in price_snapshots)
-    peak_depth = max(s[2] for s in price_snapshots)
-    trough_depth = min(s[2] for s in price_snapshots)
+    first_ts, first_secs, first_bid, first_depth = price_snapshots[0]
+    last_ts, last_secs, last_bid, last_depth = price_snapshots[-1]
+    peak_bid = max(s[2] for s in price_snapshots)
+    trough_bid = min(s[2] for s in price_snapshots)
+    peak_depth = max(s[3] for s in price_snapshots)
+    trough_depth = min(s[3] for s in price_snapshots)
+    monitor_window_secs = max(0.0, (last_ts - first_ts).total_seconds())
+    held_secs = max(0.0, (last_ts - position.entry_time).total_seconds())
+    tminus_line = ""
+    if position.entry_seconds_remaining is not None:
+        tminus_delta = position.entry_seconds_remaining - last_secs
+        tminus_line = (
+            f"  T-minus: entry T-{position.entry_seconds_remaining:.0f}s  ->  "
+            f"loss T-{last_secs:.0f}s  (delta {tminus_delta:.0f}s)"
+        )
 
     lines = [
-        f"LOSS POST-MORTEM | Side={position.side} | entry={entry:.4f}",
-        f"  Price journey: {first_bid:.4f} @ T-{first_secs:.0f}s  →  {last_bid:.4f} @ T-{last_secs:.0f}s",
+        f"LOSS POST-MORTEM [{loss_reason}] | trade_id={position.trade_id} | Side={position.side} | entry={entry:.4f}",
+        f"  Entry TS: {position.entry_time.isoformat()} | First snap TS: {first_ts.isoformat()} | Loss snap TS: {last_ts.isoformat()}",
+        f"  Held: {held_secs:.1f}s ({_format_duration(held_secs)}) | Monitor window: {monitor_window_secs:.1f}s",
+        f"  Price journey: {first_bid:.4f} @ {first_ts.isoformat()} (T-{first_secs:.0f}s)  ->  "
+        f"{last_bid:.4f} @ {last_ts.isoformat()} (T-{last_secs:.0f}s)",
         f"  Peak={peak_bid:.4f}  Trough={trough_bid:.4f}  Drift={last_bid - first_bid:+.4f}",
         f"  Depth: peak=${peak_depth:.0f}  trough=${trough_depth:.0f}  final=${last_depth:.0f}",
         f"  Snapshots ({len(price_snapshots)}):",
     ]
-    for secs, bid, depth in price_snapshots:
+    if tminus_line:
+        lines.append(tminus_line)
+    for snap_ts, secs, bid, depth in price_snapshots:
         delta = bid - entry
-        lines.append(f"    T-{secs:5.0f}s  bid={bid:.4f} ({delta:+.4f} vs entry)  depth=${depth:.0f}")
+        lines.append(
+            f"    {snap_ts.isoformat()} | T-{secs:5.0f}s | "
+            f"bid={bid:.4f} ({delta:+.4f} vs entry) | depth=${depth:.0f}"
+        )
     msg = "\n".join(lines)
     logger.warning(msg)
     if notifier and notifier.enabled:
         slack_body = (
             ":microscope: *LOSS POST-MORTEM*\n"
+            f"> Reason: *{loss_reason}* | Trade ID: `{position.trade_id}`\n"
             f"> Side: *{position.side}* | Entry: {entry:.4f}\n"
+            f"> Entry TS: `{position.entry_time.isoformat()}`\n"
+            f"> Loss TS: `{last_ts.isoformat()}` | Held: `{_format_duration(held_secs)}`\n"
             f"> Price drift: {first_bid:.4f} → {last_bid:.4f} "
             f"({last_bid - first_bid:+.4f} net)\n"
             f"> Peak: {peak_bid:.4f} | Trough: {trough_bid:.4f}\n"
@@ -1304,6 +1338,11 @@ def _log_loss_postmortem(
             f"final=${last_depth:.0f}\n"
             f"> Snapshots: {len(price_snapshots)} polls over the holding period"
         )
+        if position.entry_seconds_remaining is not None:
+            slack_body += (
+                f"\n> T-minus: entry T-{position.entry_seconds_remaining:.0f}s "
+                f"-> loss T-{last_secs:.0f}s"
+            )
         import asyncio as _asyncio
         try:
             loop = _asyncio.get_event_loop()
@@ -1325,8 +1364,8 @@ async def run_stop_loss_monitor(
 ) -> str:
     logger.info("Stop-loss monitor started")
 
-    # Collect (secs_left, bid, depth) snapshots throughout the hold for post-mortem
-    price_snapshots: list[tuple[float, float, float]] = []
+    # Collect (observed_ts, secs_left, bid, depth) snapshots for loss timing post-mortems.
+    price_snapshots: list[tuple[datetime, float, float, float]] = []
 
     while engine.has_position and not shutdown_event.is_set():
         secs_left = market.seconds_until_resolution
@@ -1376,7 +1415,10 @@ async def run_stop_loss_monitor(
                     f"{'WIN' if won else 'LOSS'}"
                 )
             if not won:
-                _log_loss_postmortem(logger, engine.position, price_snapshots, notifier)
+                _log_loss_postmortem(
+                    logger, engine.position, price_snapshots,
+                    loss_reason="RESOLUTION_LOSS", notifier=notifier,
+                )
             await engine.exit_resolution(won, resolution_outcome=winning_outcome)
             return "resolution"
 
@@ -1401,7 +1443,12 @@ async def run_stop_loss_monitor(
             continue
 
         # Record snapshot for post-mortem
-        price_snapshots.append((secs_left, current_bid, current_depth))
+        price_snapshots.append((
+            datetime.now(timezone.utc),
+            secs_left,
+            current_bid,
+            current_depth,
+        ))
 
         logger.debug(
             f"Stop-loss check: bid={current_bid:.4f} depth=${current_depth:.0f} | "
@@ -1413,7 +1460,10 @@ async def run_stop_loss_monitor(
                 f"STOP-LOSS TRIGGERED: {current_bid:.4f} < "
                 f"{config.stop_loss_threshold}"
             )
-            _log_loss_postmortem(logger, engine.position, price_snapshots, notifier)
+            _log_loss_postmortem(
+                logger, engine.position, price_snapshots,
+                loss_reason="STOP_LOSS_TRIGGER", notifier=notifier,
+            )
             await engine.exit_stop_loss(current_bid, market)
             return "stop_loss"
 
