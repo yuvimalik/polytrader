@@ -1,0 +1,5 @@
+.env
+polytrader.log
+trades.jsonl
+__pycache__/
+*.pyc
