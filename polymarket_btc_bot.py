@@ -108,10 +108,11 @@ class SlackNotifier:
 
     def __init__(
         self, webhook_url: str, tick_webhook_url: str,
-        logger: logging.Logger, dry_run: bool,
+        logger: logging.Logger, dry_run: bool, strategy_name: str = "",
     ):
         self._url = webhook_url
         self._tick_url = tick_webhook_url
+        self._strategy_name = strategy_name.upper() if strategy_name else ""
         self._logger = logger
         self._dry_run = dry_run
         self._session: Optional[aiohttp.ClientSession] = None
@@ -166,8 +167,9 @@ class SlackNotifier:
 
         pnl_str = f"${record.pnl:+.2f}" if record.pnl is not None else "n/a"
         poly_url = f"{POLYMARKET_EVENT_URL}/{record.market_slug}"
+        strategy_tag = f" [{self._strategy_name}]" if self._strategy_name else ""
         text = (
-            f"{icon} *{record.action}* [{mode}]\n"
+            f"{icon} *{record.action}* [{mode}]{strategy_tag}\n"
             f"> Market: `{record.market_slug}` (<{poly_url}|Polymarket>)\n"
             f"> Side: *{record.side}* @ {record.price:.4f}\n"
             f"> Shares: {record.shares:.2f} | Fee: ${record.fee:.4f}\n"
@@ -186,8 +188,9 @@ class SlackNotifier:
         self, n_1h: int, pnl_1h: float, n_24h: int, pnl_24h: float,
     ) -> None:
         """Send hourly and 24h P/L summary to Slack."""
+        strategy_tag = f" [{self._strategy_name}]" if self._strategy_name else ""
         text = (
-            ":chart_with_upwards_trend: *P/L summary*\n"
+            f":chart_with_upwards_trend: *P/L summary*{strategy_tag}\n"
             f"> Last 1h:  *{n_1h}* trades | ${pnl_1h:+.2f}\n"
             f"> Last 24h: *{n_24h}* trades | ${pnl_24h:+.2f}"
         )
@@ -199,8 +202,9 @@ class SlackNotifier:
 
     async def notify_startup(self, config: "Config") -> None:
         mode = "PAPER" if config.dry_run else "LIVE"
+        strategy_tag = f" [{self._strategy_name}]" if self._strategy_name else ""
         text = (
-            f":rocket: *Polytrader started* [{mode}]\n"
+            f":rocket: *Polytrader started* [{mode}]{strategy_tag}\n"
             f"> Entry threshold: {config.entry_threshold}\n"
             f"> Stop-loss: {config.stop_loss_threshold}\n"
             f"> Size: ${config.entry_size_usd}\n"
@@ -213,8 +217,9 @@ class SlackNotifier:
         if engine.has_position:
             pos = engine.position
             pos_str = f"{pos.side} x{pos.shares:.1f} @ {pos.entry_price:.4f}"
+        strategy_tag = f" [{self._strategy_name}]" if self._strategy_name else ""
         text = (
-            f":stop_sign: *Polytrader stopped*\n"
+            f":stop_sign: *Polytrader stopped*{strategy_tag}\n"
             f"> Trades: {self.trades_count} | PnL: ${self.total_pnl:+.2f} "
             f"({self.wins}W/{self.losses}L)\n"
             f"> Open position: {pos_str}"
@@ -241,8 +246,9 @@ class SlackNotifier:
             pos = engine.position
             pos_str = f"{pos.side} x{pos.shares:.1f} @ {pos.entry_price:.4f}"
 
+        strategy_tag = f" [{self._strategy_name}]" if self._strategy_name else ""
         text = (
-            f":chart_with_upwards_trend: *Heartbeat* [{mode}]\n"
+            f":chart_with_upwards_trend: *Heartbeat* [{mode}]{strategy_tag}\n"
             f"> Market: {market_str}\n"
             f"> Position: {pos_str}\n"
             f"> Session: {self.trades_count} trades | "
@@ -322,6 +328,7 @@ class Config:
     min_book_depth_usd: float = MIN_BOOK_DEPTH_USD
     strategy: StrategyType = StrategyType.MOMENTUM
     allowed_hours_et: Optional[frozenset] = None  # None = trade all hours
+    trade_log_file: str = TRADE_LOG_FILE
     log_level: str = "INFO"
     slack_webhook_url: str = ""
     slack_tick_webhook_url: str = ""
@@ -369,6 +376,7 @@ class Config:
             stop_loss_threshold=args.stop_loss,
             entry_size_usd=args.size,
             strategy=StrategyType.MOMENTUM,
+            trade_log_file="trades_momentum.jsonl",
             slack_webhook_url=momentum_url,
             slack_tick_webhook_url=momentum_tick_url,
         )
@@ -377,6 +385,7 @@ class Config:
             stop_loss_threshold=args.stop_loss,
             entry_size_usd=CONTRARIAN_ENTRY_SIZE_USD,
             strategy=StrategyType.CONTRARIAN,
+            trade_log_file="trades_contrarian.jsonl",
             # Falls back to momentum webhook if dedicated one not set
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL_CONTRARIAN", momentum_url),
             slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL_CONTRARIAN", ""),
@@ -386,6 +395,7 @@ class Config:
             stop_loss_threshold=TIMED_STOP_LOSS,
             entry_size_usd=args.size,
             strategy=StrategyType.TIMED,
+            trade_log_file="trades_timed.jsonl",
             allowed_hours_et=TIMED_ALLOWED_HOURS_ET,
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL_TIMED", momentum_url),
             slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL_TIMED", ""),
@@ -875,17 +885,18 @@ class TradeRecord:
 
 def _compute_pnl_for_window(
     since_utc: datetime,
+    trade_log_file: str = TRADE_LOG_FILE,
 ) -> tuple[int, float]:
     """
-    Read trades.jsonl and return (exit_trade_count, total_pnl) for trades
+    Read a trade log and return (exit_trade_count, total_pnl) for trades
     with timestamp >= since_utc. Only EXIT_STOP_LOSS and EXIT_RESOLUTION count.
     """
     count = 0
     total_pnl = 0.0
-    if not os.path.isfile(TRADE_LOG_FILE):
+    if not os.path.isfile(trade_log_file):
         return 0, 0.0
     try:
-        with open(TRADE_LOG_FILE, "r") as f:
+        with open(trade_log_file, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -922,8 +933,9 @@ def _compute_pnl_for_window(
 def log_trade(
     record: TradeRecord, logger: logging.Logger,
     notifier: Optional[SlackNotifier] = None,
+    trade_log_file: str = TRADE_LOG_FILE,
 ) -> None:
-    with open(TRADE_LOG_FILE, "a") as f:
+    with open(trade_log_file, "a") as f:
         f.write(json.dumps(asdict(record)) + "\n")
     tid = f" | trade_id={record.trade_id}" if record.trade_id else ""
     res = ""
@@ -938,13 +950,13 @@ def log_trade(
         asyncio.ensure_future(notifier.notify_trade(record))
 
 
-def _compute_pnl_summaries() -> tuple[int, float, int, float]:
+def _compute_pnl_summaries(trade_log_file: str = TRADE_LOG_FILE) -> tuple[int, float, int, float]:
     """Return (n_1h, pnl_1h, n_24h, pnl_24h) for exit trades in last 1h and 24h."""
     now = datetime.now(timezone.utc)
     one_hour_ago = now - timedelta(hours=1)
     one_day_ago = now - timedelta(hours=24)
-    n1, pnl1 = _compute_pnl_for_window(one_hour_ago)
-    n24, pnl24 = _compute_pnl_for_window(one_day_ago)
+    n1, pnl1 = _compute_pnl_for_window(one_hour_ago, trade_log_file)
+    n24, pnl24 = _compute_pnl_for_window(one_day_ago, trade_log_file)
     return n1, pnl1, n24, pnl24
 
 
@@ -953,6 +965,7 @@ async def _pnl_summary_loop(
     shutdown_event: asyncio.Event,
     notifier: Optional["SlackNotifier"] = None,
     interval_seconds: float = 3600.0,
+    trade_log_file: str = TRADE_LOG_FILE,
 ) -> None:
     """Every interval_seconds, send 1h and 24h P/L summaries to Slack (and log at DEBUG)."""
     while not shutdown_event.is_set():
@@ -964,7 +977,7 @@ async def _pnl_summary_loop(
             pass
         if shutdown_event.is_set():
             break
-        n1, pnl1, n24, pnl24 = _compute_pnl_summaries()
+        n1, pnl1, n24, pnl24 = _compute_pnl_summaries(trade_log_file)
         logger.debug(
             f"P/L summary [1h]: {n1} trades | ${pnl1:+.2f} | [24h]: {n24} trades | ${pnl24:+.2f}"
         )
@@ -978,9 +991,13 @@ async def _pnl_summary_loop(
 
 
 class PaperTradeEngine:
-    def __init__(self, logger: logging.Logger, notifier: Optional[SlackNotifier] = None):
+    def __init__(
+        self, logger: logging.Logger, notifier: Optional[SlackNotifier] = None,
+        trade_log_file: str = TRADE_LOG_FILE,
+    ):
         self.logger = logger
         self.notifier = notifier
+        self.trade_log_file = trade_log_file
         self.position: Optional[Position] = None
 
     async def enter(
@@ -1025,7 +1042,7 @@ class PaperTradeEngine:
             opposing_best_bid=signal.opposing_best_bid,
             market_id=market.market_id,
             condition_id=market.condition_id,
-        ), self.logger, self.notifier)
+        ), self.logger, self.notifier, trade_log_file=self.trade_log_file)
         return True
 
     async def exit_stop_loss(
@@ -1054,7 +1071,7 @@ class PaperTradeEngine:
             condition_id=pos.condition_id,
             entry_price=pos.entry_price,
             entry_seconds_remaining=pos.entry_seconds_remaining,
-        ), self.logger, self.notifier)
+        ), self.logger, self.notifier, trade_log_file=self.trade_log_file)
         self.position = None
 
     async def exit_resolution(
@@ -1084,7 +1101,7 @@ class PaperTradeEngine:
             condition_id=pos.condition_id,
             entry_price=pos.entry_price,
             entry_seconds_remaining=pos.entry_seconds_remaining,
-        ), self.logger, self.notifier)
+        ), self.logger, self.notifier, trade_log_file=self.trade_log_file)
         self.position = None
 
     @property
@@ -1102,6 +1119,7 @@ class LiveTradeEngine:
         self.logger = logger
         self.config = config
         self.notifier = notifier
+        self.trade_log_file = config.trade_log_file
         self.position: Optional[Position] = None
         self._client = None
 
@@ -1209,7 +1227,7 @@ class LiveTradeEngine:
             opposing_best_bid=signal.opposing_best_bid,
             market_id=market.market_id,
             condition_id=market.condition_id,
-        ), self.logger, self.notifier)
+        ), self.logger, self.notifier, trade_log_file=self.trade_log_file)
         return True
 
     async def exit_stop_loss(
@@ -1261,7 +1279,7 @@ class LiveTradeEngine:
             condition_id=pos.condition_id,
             entry_price=pos.entry_price,
             entry_seconds_remaining=pos.entry_seconds_remaining,
-        ), self.logger, self.notifier)
+        ), self.logger, self.notifier, trade_log_file=self.trade_log_file)
         self.position = None
 
     async def exit_resolution(
@@ -1291,7 +1309,7 @@ class LiveTradeEngine:
             condition_id=pos.condition_id,
             entry_price=pos.entry_price,
             entry_seconds_remaining=pos.entry_seconds_remaining,
-        ), self.logger, self.notifier)
+        ), self.logger, self.notifier, trade_log_file=self.trade_log_file)
         self.position = None
 
     @property
@@ -1881,10 +1899,11 @@ async def _run_strategy(
     notifier = SlackNotifier(
         config.slack_webhook_url, config.slack_tick_webhook_url,
         strategy_logger, config.dry_run,
+        strategy_name=config.strategy.value,
     )
 
     if config.dry_run:
-        engine = PaperTradeEngine(strategy_logger, notifier)
+        engine = PaperTradeEngine(strategy_logger, notifier, trade_log_file=config.trade_log_file)
         clob_client = None
         strategy_logger.info(f"[{config.strategy.value}] PAPER TRADING MODE")
     else:
@@ -1897,7 +1916,8 @@ async def _run_strategy(
 
     summary_task = asyncio.create_task(
         _pnl_summary_loop(
-            strategy_logger, shutdown_event, notifier=notifier, interval_seconds=3600.0
+            strategy_logger, shutdown_event, notifier=notifier, interval_seconds=3600.0,
+            trade_log_file=config.trade_log_file,
         ),
     )
 
