@@ -16,12 +16,20 @@ import asyncio
 import logging
 import argparse
 import uuid
+from enum import Enum
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from dotenv import load_dotenv
+
+
+class StrategyType(str, Enum):
+    MOMENTUM   = "momentum"    # Bet the favored (high-confidence) side
+    CONTRARIAN = "contrarian"  # Bet the opposing (underdog) side
+    TIMED      = "timed"       # Momentum with ET hour filter + tighter stop loss
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,6 +46,15 @@ STOP_LOSS_THRESHOLD = 0.60
 ENTRY_SIZE_USD = 500.0
 ENTRY_GIVE_UP_SECS = 30    # Don't attempt entry with fewer than 30s left
 MIN_BOOK_DEPTH_USD = 1000.0  # Min favored-side bid depth ($) required to enter
+
+# --- Per-strategy overrides ---
+CONTRARIAN_ENTRY_SIZE_USD = 50.0    # Contrarian bets small; ~11x payout if correct
+TIMED_STOP_LOSS = 0.88              # Tighter stop loss for the timed strategy
+ET_ZONE = ZoneInfo("America/New_York")
+# ET hours when the timed strategy may enter (all others are blocked)
+TIMED_ALLOWED_HOURS_ET: frozenset = frozenset({
+    0, 1, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22
+})
 HOT_ZONE_START = 350       # switch to 1s polling when <= this many secs left
 HOT_POLL_INTERVAL = 1      # seconds between polls in hot zone
 MAIN_LOOP_INTERVAL = 60
@@ -303,12 +320,15 @@ class Config:
     stop_loss_threshold: float = STOP_LOSS_THRESHOLD
     entry_size_usd: float = ENTRY_SIZE_USD
     min_book_depth_usd: float = MIN_BOOK_DEPTH_USD
+    strategy: StrategyType = StrategyType.MOMENTUM
+    allowed_hours_et: Optional[frozenset] = None  # None = trade all hours
     log_level: str = "INFO"
     slack_webhook_url: str = ""
     slack_tick_webhook_url: str = ""
 
     @classmethod
-    def from_env_and_args(cls) -> "Config":
+    def build_all_configs(cls) -> "list[Config]":
+        """Parse CLI args + env once, return one Config per strategy."""
         load_dotenv()
 
         parser = argparse.ArgumentParser(description="Polymarket BTC 15m Bot")
@@ -329,7 +349,7 @@ class Config:
         )
         args = parser.parse_args()
 
-        return cls(
+        shared = dict(
             dry_run=args.dry_run,
             pk=os.getenv("PK", ""),
             api_key=os.getenv("API_KEY", ""),
@@ -337,13 +357,40 @@ class Config:
             api_passphrase=os.getenv("API_PASSPHRASE", ""),
             funder=os.getenv("FUNDER", ""),
             entry_threshold=args.entry_threshold,
-            stop_loss_threshold=args.stop_loss,
-            entry_size_usd=args.size,
             min_book_depth_usd=args.min_depth,
             log_level=args.log_level,
-            slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", ""),
-            slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL", ""),
         )
+
+        momentum_url      = os.getenv("SLACK_WEBHOOK_URL", "")
+        momentum_tick_url = os.getenv("SLACK_TICK_WEBHOOK_URL", "")
+
+        momentum = cls(
+            **shared,
+            stop_loss_threshold=args.stop_loss,
+            entry_size_usd=args.size,
+            strategy=StrategyType.MOMENTUM,
+            slack_webhook_url=momentum_url,
+            slack_tick_webhook_url=momentum_tick_url,
+        )
+        contrarian = cls(
+            **shared,
+            stop_loss_threshold=args.stop_loss,
+            entry_size_usd=CONTRARIAN_ENTRY_SIZE_USD,
+            strategy=StrategyType.CONTRARIAN,
+            # Falls back to momentum webhook if dedicated one not set
+            slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL_CONTRARIAN", momentum_url),
+            slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL_CONTRARIAN", ""),
+        )
+        timed = cls(
+            **shared,
+            stop_loss_threshold=TIMED_STOP_LOSS,
+            entry_size_usd=args.size,
+            strategy=StrategyType.TIMED,
+            allowed_hours_et=TIMED_ALLOWED_HOURS_ET,
+            slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL_TIMED", momentum_url),
+            slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL_TIMED", ""),
+        )
+        return [momentum, contrarian, timed]
 
     def validate(self) -> None:
         if not self.dry_run:
@@ -377,6 +424,11 @@ class Market:
     def seconds_until_resolution(self) -> float:
         return (self.end_date - datetime.now(timezone.utc)).total_seconds()
 
+
+
+def _current_hour_et() -> int:
+    """Return current hour (0-23) in US Eastern time (handles DST automatically)."""
+    return datetime.now(ET_ZONE).hour
 
 
 def _compute_candidate_slugs(now_ts: float, count: int = 4) -> list[str]:
@@ -1555,6 +1607,70 @@ def _format_ticker(
     return line
 
 
+def _resolve_entry(
+    config: "Config",
+    market: "Market",
+    fav_side: str,
+    fav_tid: str,
+    fav_bid: float,
+    opp_bid: float,
+    depth_fav: float,
+    depth_opp: float,
+    up_bid: float,
+    down_bid: float,
+    logger: logging.Logger,
+) -> "Optional[tuple[str, OrderBookSignal]]":
+    """
+    Determine whether to enter and on which side, based on strategy.
+    Returns (log_label, signal) or None to skip entry.
+    Handles: TIMED hour gate, CONTRARIAN side flip, depth filter.
+    """
+    # TIMED: hour gate (ET)
+    if config.allowed_hours_et is not None:
+        hour_et = _current_hour_et()
+        if hour_et not in config.allowed_hours_et:
+            logger.debug(
+                f"[{config.strategy.value}] TIMED: hour {hour_et} ET not in allowed hours — skipping entry"
+            )
+            return None
+
+    if config.strategy == StrategyType.CONTRARIAN:
+        # Bet the underdog (opposing) side when market is skewed
+        bet_side = "Down" if fav_side == "Up" else "Up"
+        bet_tid  = market.token_id_down if fav_side == "Up" else market.token_id_up
+        bet_bid  = opp_bid
+        depth_bet, depth_against = depth_opp, depth_fav
+        label = (
+            f"CONTRARIAN ({fav_side} @ {fav_bid:.4f} favored "
+            f"→ betting {bet_side} @ {bet_bid:.4f})"
+        )
+    else:
+        bet_side, bet_tid, bet_bid = fav_side, fav_tid, fav_bid
+        depth_bet, depth_against   = depth_fav, depth_opp
+        label = f"{config.strategy.value.upper()} {bet_side} @ {bet_bid:.4f}"
+
+    # Depth filter — applied to the side we're actually betting
+    if depth_bet < config.min_book_depth_usd:
+        logger.info(
+            f"[{config.strategy.value}] DEPTH FILTER: {label} "
+            f"depth=${depth_bet:.0f} < min ${config.min_book_depth_usd:.0f} — skipping"
+        )
+        return None
+
+    sig = OrderBookSignal(
+        favored_side=bet_side,
+        favored_token_id=bet_tid,
+        best_bid=bet_bid,
+        opposing_best_bid=fav_bid if config.strategy == StrategyType.CONTRARIAN else opp_bid,
+        book_depth_favored=depth_bet,
+        book_depth_opposing=depth_against,
+        is_entry_worthy=True,
+        up_best_bid=up_bid,
+        down_best_bid=down_bid,
+    )
+    return label, sig
+
+
 async def _run_one_cycle(
     engine,
     session: aiohttp.ClientSession,
@@ -1648,28 +1764,13 @@ async def _run_one_cycle(
                     opp_bid, depth_fav, depth_opp = up_bid, down_depth, up_depth
 
                 if fav_bid >= config.entry_threshold:
-                    if depth_fav < config.min_book_depth_usd:
-                        logger.info(
-                            f"DEPTH FILTER (far zone): {fav_side} @ {fav_bid:.4f} threshold met "
-                            f"but depth=${depth_fav:.0f} < min ${config.min_book_depth_usd:.0f} "
-                            f"| opp depth=${depth_opp:.0f} — skipping entry"
-                        )
-                    else:
-                        logger.info(
-                            f"*** ENTRY SIGNAL (far zone) *** {fav_side} @ {fav_bid:.4f} >= "
-                            f"{config.entry_threshold} | depth=${depth_fav:.0f} (min=${config.min_book_depth_usd:.0f})"
-                        )
-                        sig = OrderBookSignal(
-                            favored_side=fav_side,
-                            favored_token_id=fav_tid,
-                            best_bid=fav_bid,
-                            opposing_best_bid=opp_bid,
-                            book_depth_favored=depth_fav,
-                            book_depth_opposing=depth_opp,
-                            is_entry_worthy=True,
-                            up_best_bid=up_bid,
-                            down_best_bid=down_bid,
-                        )
+                    entry = _resolve_entry(
+                        config, market, fav_side, fav_tid, fav_bid,
+                        opp_bid, depth_fav, depth_opp, up_bid, down_bid, logger,
+                    )
+                    if entry is not None:
+                        label, sig = entry
+                        logger.info(f"*** ENTRY SIGNAL (far zone) *** {label}")
                         success = await engine.enter(market, sig, config)
                         if success:
                             logger.info("Entry successful (far zone) -- switching to stop-loss monitor")
@@ -1746,28 +1847,13 @@ async def _run_one_cycle(
             if fav_bid >= config.entry_threshold:
                 depth_fav = up_depth if fav_side == "Up" else down_depth
                 depth_opp = down_depth if fav_side == "Up" else up_depth
-                if depth_fav < config.min_book_depth_usd:
-                    logger.info(
-                        f"DEPTH FILTER: {fav_side} @ {fav_bid:.4f} threshold met "
-                        f"but depth=${depth_fav:.0f} < min ${config.min_book_depth_usd:.0f} "
-                        f"| opp depth=${depth_opp:.0f} — skipping entry"
-                    )
-                else:
-                    logger.info(
-                        f"*** ENTRY SIGNAL *** {fav_side} @ {fav_bid:.4f} >= "
-                        f"{config.entry_threshold} | depth=${depth_fav:.0f} (min=${config.min_book_depth_usd:.0f})"
-                    )
-                    sig = OrderBookSignal(
-                        favored_side=fav_side,
-                        favored_token_id=fav_tid,
-                        best_bid=fav_bid,
-                        opposing_best_bid=opp_bid,
-                        book_depth_favored=depth_fav,
-                        book_depth_opposing=depth_opp,
-                        is_entry_worthy=True,
-                        up_best_bid=up_bid,
-                        down_best_bid=down_bid,
-                    )
+                entry = _resolve_entry(
+                    config, market, fav_side, fav_tid, fav_bid,
+                    opp_bid, depth_fav, depth_opp, up_bid, down_bid, logger,
+                )
+                if entry is not None:
+                    label, sig = entry
+                    logger.info(f"*** ENTRY SIGNAL *** {label}")
                     success = await engine.enter(market, sig, config)
                     if success:
                         logger.info("Entry successful -- switching to stop-loss monitor")
@@ -1786,42 +1872,32 @@ async def _run_one_cycle(
         await _interruptible_sleep(HOT_POLL_INTERVAL, shutdown_event)
 
 
-async def main_loop(config: Config, logger: logging.Logger) -> None:
-    shutdown_event = asyncio.Event()
+async def _run_strategy(
+    config: Config,
+    strategy_logger: logging.Logger,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Run one strategy loop independently (engine, notifier, session are per-strategy)."""
     notifier = SlackNotifier(
         config.slack_webhook_url, config.slack_tick_webhook_url,
-        logger, config.dry_run,
+        strategy_logger, config.dry_run,
     )
 
-    def _signal_handler():
-        logger.info("Shutdown signal received")
-        shutdown_event.set()
-
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            signal.signal(sig, lambda s, f: _signal_handler())
-
     if config.dry_run:
-        engine = PaperTradeEngine(logger, notifier)
+        engine = PaperTradeEngine(strategy_logger, notifier)
         clob_client = None
-        logger.info("=== PAPER TRADING MODE ===")
+        strategy_logger.info(f"[{config.strategy.value}] PAPER TRADING MODE")
     else:
-        engine = LiveTradeEngine(config, logger, notifier)
+        engine = LiveTradeEngine(config, strategy_logger, notifier)
         clob_client = await engine._get_client()
-        logger.info("=== LIVE TRADING MODE ===")
+        strategy_logger.info(f"[{config.strategy.value}] LIVE TRADING MODE")
 
     if notifier.enabled:
-        logger.info("Slack notifications enabled")
-    else:
-        logger.info("Slack notifications disabled (no SLACK_WEBHOOK_URL)")
+        strategy_logger.info(f"[{config.strategy.value}] Slack enabled")
 
-    # Start hourly/24h P/L summary task (sends to Slack when webhook configured)
     summary_task = asyncio.create_task(
         _pnl_summary_loop(
-            logger, shutdown_event, notifier=notifier, interval_seconds=3600.0
+            strategy_logger, shutdown_event, notifier=notifier, interval_seconds=3600.0
         ),
     )
 
@@ -1832,12 +1908,12 @@ async def main_loop(config: Config, logger: logging.Logger) -> None:
         while not shutdown_event.is_set():
             try:
                 await _run_one_cycle(
-                    engine, session, clob_client, config, logger,
+                    engine, session, clob_client, config, strategy_logger,
                     shutdown_event, notifier,
                 )
                 await notifier.maybe_heartbeat(None, engine)
             except Exception as e:
-                logger.exception(f"Unhandled error in cycle: {e}")
+                strategy_logger.exception(f"[{config.strategy.value}] Unhandled error: {e}")
                 await notifier.notify_error(str(e))
                 await _interruptible_sleep(MAIN_LOOP_INTERVAL, shutdown_event)
 
@@ -1850,11 +1926,39 @@ async def main_loop(config: Config, logger: logging.Logger) -> None:
         pass
 
     if engine.has_position:
-        logger.warning(
-            f"Shutting down with open position: "
+        strategy_logger.warning(
+            f"[{config.strategy.value}] Shutting down with open position: "
             f"{engine.position.market_slug} {engine.position.side} "
             f"@ {engine.position.entry_price}"
         )
+
+
+async def main_loop(configs: "list[Config]", logger: logging.Logger) -> None:
+    """Run all strategies concurrently. One shared shutdown event."""
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler():
+        logger.info("Shutdown signal received — stopping all strategies")
+        shutdown_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            signal.signal(sig, lambda s, f: _signal_handler())
+
+    tasks = [
+        asyncio.create_task(
+            _run_strategy(
+                cfg,
+                logging.getLogger(f"bot.{cfg.strategy.value}"),
+                shutdown_event,
+            )
+        )
+        for cfg in configs
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1863,20 +1967,22 @@ async def main_loop(config: Config, logger: logging.Logger) -> None:
 
 
 def main():
-    config = Config.from_env_and_args()
-    config.validate()
-    logger = setup_logging(config.log_level)
+    configs = Config.build_all_configs()
+    logger = setup_logging(configs[0].log_level)
 
     logger.info("=" * 60)
-    logger.info("Polymarket BTC 15m Up/Down Bot starting")
-    logger.info(f"Mode: {'PAPER' if config.dry_run else 'LIVE'}")
-    logger.info(f"Entry threshold: {config.entry_threshold}")
-    logger.info(f"Stop-loss threshold: {config.stop_loss_threshold}")
-    logger.info(f"Entry size: ${config.entry_size_usd}")
+    logger.info("Polymarket BTC 15m Up/Down Bot — multi-strategy")
+    logger.info(f"Mode: {'PAPER' if configs[0].dry_run else 'LIVE'}")
+    for cfg in configs:
+        logger.info(
+            f"  [{cfg.strategy.value}] threshold={cfg.entry_threshold} "
+            f"stop={cfg.stop_loss_threshold} size=${cfg.entry_size_usd} "
+            f"hours={'all' if cfg.allowed_hours_et is None else 'filtered (ET)'}"
+        )
     logger.info("=" * 60)
 
     try:
-        asyncio.run(main_loop(config, logger))
+        asyncio.run(main_loop(configs, logger))
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt -- exiting")
     finally:
