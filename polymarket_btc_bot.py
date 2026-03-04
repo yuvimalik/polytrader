@@ -11,6 +11,7 @@ live execution via py-clob-client.
 import os
 import sys
 import json
+import time
 import signal
 import asyncio
 import logging
@@ -28,8 +29,9 @@ from dotenv import load_dotenv
 
 class StrategyType(str, Enum):
     MOMENTUM   = "momentum"    # Bet the favored (high-confidence) side
-    CONTRARIAN = "contrarian"  # Bet the opposing (underdog) side
+    CONTRARIAN = "contrarian"  # Bet the opposing (underdog) side ($50, small)
     TIMED      = "timed"       # Momentum with ET hour filter + tighter stop loss
+    MIRROR     = "mirror"      # Bet opposing side with same $500 capital as Momentum
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,6 +52,7 @@ MIN_BOOK_DEPTH_USD = 1000.0  # Min favored-side bid depth ($) required to enter
 # --- Per-strategy overrides ---
 CONTRARIAN_ENTRY_SIZE_USD = 50.0    # Contrarian bets small; ~11x payout if correct
 TIMED_STOP_LOSS = 0.88              # Tighter stop loss for the timed strategy
+ENTRY_HOLD_SECS: float = 60.0       # Momentum only: price must hold >= threshold this long before entry
 ET_ZONE = ZoneInfo("America/New_York")
 # ET hours when the timed strategy may enter (all others are blocked)
 TIMED_ALLOWED_HOURS_ET: frozenset = frozenset({
@@ -228,7 +231,6 @@ class SlackNotifier:
 
     async def maybe_heartbeat(self, market: Optional["Market"], engine) -> None:
         """Send a heartbeat if HEARTBEAT_INTERVAL has elapsed."""
-        import time
         now = time.monotonic()
         if now - self._last_heartbeat < HEARTBEAT_INTERVAL:
             return
@@ -328,6 +330,7 @@ class Config:
     min_book_depth_usd: float = MIN_BOOK_DEPTH_USD
     strategy: StrategyType = StrategyType.MOMENTUM
     allowed_hours_et: Optional[frozenset] = None  # None = trade all hours
+    entry_hold_secs: float = 0.0    # 0 = disabled; >0 = price must hold at threshold this long
     trade_log_file: str = TRADE_LOG_FILE
     log_level: str = "INFO"
     slack_webhook_url: str = ""
@@ -376,6 +379,7 @@ class Config:
             stop_loss_threshold=args.stop_loss,
             entry_size_usd=args.size,
             strategy=StrategyType.MOMENTUM,
+            entry_hold_secs=ENTRY_HOLD_SECS,  # require 60s at threshold before entering
             trade_log_file="trades_momentum.jsonl",
             slack_webhook_url=momentum_url,
             slack_tick_webhook_url=momentum_tick_url,
@@ -400,7 +404,16 @@ class Config:
             slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL_TIMED", momentum_url),
             slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL_TIMED", ""),
         )
-        return [momentum, contrarian, timed]
+        mirror = cls(
+            **shared,
+            stop_loss_threshold=args.stop_loss,
+            entry_size_usd=args.size,         # Same $500 as Momentum
+            strategy=StrategyType.MIRROR,
+            trade_log_file="trades_mirror.jsonl",
+            slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL_MIRROR", momentum_url),
+            slack_tick_webhook_url=os.getenv("SLACK_TICK_WEBHOOK_URL_MIRROR", ""),
+        )
+        return [momentum, contrarian, timed, mirror]
 
     def validate(self) -> None:
         if not self.dry_run:
@@ -716,6 +729,7 @@ class OrderBookSignal:
     is_entry_worthy: bool
     up_best_bid: float
     down_best_bid: float
+    entry_size_usd: Optional[float] = None  # Per-signal override; None = use config.entry_size_usd
 
 
 async def _fetch_book_http(
@@ -1004,7 +1018,8 @@ class PaperTradeEngine:
         self, market: Market, signal: OrderBookSignal, config: Config,
     ) -> bool:
         price = signal.best_bid
-        shares = compute_shares(config.entry_size_usd, price)
+        size_usd = signal.entry_size_usd if signal.entry_size_usd is not None else config.entry_size_usd
+        shares = compute_shares(size_usd, price)
         fee = compute_fee(shares, price)
 
         trade_id = _new_trade_id()
@@ -1169,7 +1184,8 @@ class LiveTradeEngine:
 
         client = await self._get_client()
         price = signal.best_bid
-        shares = compute_shares(config.entry_size_usd, price)
+        size_usd = signal.entry_size_usd if signal.entry_size_usd is not None else config.entry_size_usd
+        shares = compute_shares(size_usd, price)
         fee = compute_fee(shares, price)
         rounded_shares = round(shares, 2)
 
@@ -1652,14 +1668,15 @@ def _resolve_entry(
             )
             return None
 
-    if config.strategy == StrategyType.CONTRARIAN:
+    if config.strategy in (StrategyType.CONTRARIAN, StrategyType.MIRROR):
         # Bet the underdog (opposing) side when market is skewed
         bet_side = "Down" if fav_side == "Up" else "Up"
         bet_tid  = market.token_id_down if fav_side == "Up" else market.token_id_up
         bet_bid  = opp_bid
         depth_bet, depth_against = depth_opp, depth_fav
+        strat_name = "CONTRARIAN" if config.strategy == StrategyType.CONTRARIAN else "MIRROR"
         label = (
-            f"CONTRARIAN ({fav_side} @ {fav_bid:.4f} favored "
+            f"{strat_name} ({fav_side} @ {fav_bid:.4f} favored "
             f"→ betting {bet_side} @ {bet_bid:.4f})"
         )
     else:
@@ -1675,16 +1692,21 @@ def _resolve_entry(
         )
         return None
 
+    is_opposing = config.strategy in (StrategyType.CONTRARIAN, StrategyType.MIRROR)
+    # Mirror: bet proportional to opposing price so potential payout == config.entry_size_usd
+    # e.g. $500 × 0.09 = $45 risked → $45/0.09 = $500 payout if correct
+    mirror_size = config.entry_size_usd * bet_bid if config.strategy == StrategyType.MIRROR else None
     sig = OrderBookSignal(
         favored_side=bet_side,
         favored_token_id=bet_tid,
         best_bid=bet_bid,
-        opposing_best_bid=fav_bid if config.strategy == StrategyType.CONTRARIAN else opp_bid,
+        opposing_best_bid=fav_bid if is_opposing else opp_bid,
         book_depth_favored=depth_bet,
         book_depth_opposing=depth_against,
         is_entry_worthy=True,
         up_best_bid=up_bid,
         down_best_bid=down_bid,
+        entry_size_usd=mirror_size,
     )
     return label, sig
 
@@ -1697,6 +1719,7 @@ async def _run_one_cycle(
     logger: logging.Logger,
     shutdown_event: asyncio.Event,
     notifier: Optional[SlackNotifier] = None,
+    threshold_state: Optional[dict] = None,  # {"since": Optional[float]} for persistence timer
 ) -> None:
     market = await discover_market(session, logger)
     if market is None:
@@ -1782,27 +1805,73 @@ async def _run_one_cycle(
                     opp_bid, depth_fav, depth_opp = up_bid, down_depth, up_depth
 
                 if fav_bid >= config.entry_threshold:
-                    entry = _resolve_entry(
-                        config, market, fav_side, fav_tid, fav_bid,
-                        opp_bid, depth_fav, depth_opp, up_bid, down_bid, logger,
-                    )
-                    if entry is not None:
-                        label, sig = entry
-                        logger.info(f"*** ENTRY SIGNAL (far zone) *** {label}")
-                        success = await engine.enter(market, sig, config)
-                        if success:
-                            logger.info("Entry successful (far zone) -- switching to stop-loss monitor")
-                            if notifier:
-                                await notifier.notify_market_link(market, context="entered position")
-                            result = await run_stop_loss_monitor(
-                                engine, market, session, clob_client, config,
-                                logger, shutdown_event,
-                                notifier=notifier,
+                    # Persistence filter: price must hold at/above threshold for entry_hold_secs
+                    if threshold_state is not None:
+                        if threshold_state.get("since") is None:
+                            threshold_state["since"] = time.monotonic()
+                        held_secs = time.monotonic() - threshold_state["since"]
+                        if config.entry_hold_secs > 0 and held_secs < config.entry_hold_secs:
+                            logger.info(
+                                f"[{config.strategy.value}] HOLD FILTER: "
+                                f"{held_secs:.0f}s/{config.entry_hold_secs:.0f}s at "
+                                f"threshold — waiting for sustained signal"
                             )
-                            logger.info(f"Stop-loss monitor exited: {result}")
-                            return
+                            # Don't enter yet; continue to sleep
                         else:
-                            logger.error("Entry failed (far zone) -- will retry next cycle")
+                            entry = _resolve_entry(
+                                config, market, fav_side, fav_tid, fav_bid,
+                                opp_bid, depth_fav, depth_opp, up_bid, down_bid, logger,
+                            )
+                            if entry is not None:
+                                label, sig = entry
+                                logger.info(f"*** ENTRY SIGNAL (far zone) *** {label}")
+                                success = await engine.enter(market, sig, config)
+                                if threshold_state is not None:
+                                    threshold_state["since"] = None
+                                if success:
+                                    logger.info("Entry successful (far zone) -- switching to stop-loss monitor")
+                                    if notifier:
+                                        await notifier.notify_market_link(market, context="entered position")
+                                    result = await run_stop_loss_monitor(
+                                        engine, market, session, clob_client, config,
+                                        logger, shutdown_event,
+                                        notifier=notifier,
+                                    )
+                                    logger.info(f"Stop-loss monitor exited: {result}")
+                                    return
+                                else:
+                                    logger.error("Entry failed (far zone) -- will retry next cycle")
+                    else:
+                        entry = _resolve_entry(
+                            config, market, fav_side, fav_tid, fav_bid,
+                            opp_bid, depth_fav, depth_opp, up_bid, down_bid, logger,
+                        )
+                        if entry is not None:
+                            label, sig = entry
+                            logger.info(f"*** ENTRY SIGNAL (far zone) *** {label}")
+                            success = await engine.enter(market, sig, config)
+                            if success:
+                                logger.info("Entry successful (far zone) -- switching to stop-loss monitor")
+                                if notifier:
+                                    await notifier.notify_market_link(market, context="entered position")
+                                result = await run_stop_loss_monitor(
+                                    engine, market, session, clob_client, config,
+                                    logger, shutdown_event,
+                                    notifier=notifier,
+                                )
+                                logger.info(f"Stop-loss monitor exited: {result}")
+                                return
+                            else:
+                                logger.error("Entry failed (far zone) -- will retry next cycle")
+                else:
+                    # Price dropped below threshold — reset persistence timer
+                    if threshold_state and threshold_state.get("since") is not None:
+                        held = time.monotonic() - threshold_state["since"]
+                        logger.info(
+                            f"[{config.strategy.value}] Price dropped below threshold "
+                            f"after {held:.0f}s — resetting hold timer"
+                        )
+                        threshold_state["since"] = None
 
         except Exception as e:
             logger.debug(f"Price fetch failed: {e}")
@@ -1863,6 +1932,18 @@ async def _run_one_cycle(
                 opp_bid = up_bid
 
             if fav_bid >= config.entry_threshold:
+                # Persistence filter (hot zone)
+                if threshold_state is not None:
+                    if threshold_state.get("since") is None:
+                        threshold_state["since"] = time.monotonic()
+                    held_secs = time.monotonic() - threshold_state["since"]
+                    if config.entry_hold_secs > 0 and held_secs < config.entry_hold_secs:
+                        logger.debug(
+                            f"[{config.strategy.value}] HOLD FILTER: "
+                            f"{held_secs:.0f}s/{config.entry_hold_secs:.0f}s at threshold"
+                        )
+                        await _interruptible_sleep(HOT_POLL_INTERVAL, shutdown_event)
+                        continue
                 depth_fav = up_depth if fav_side == "Up" else down_depth
                 depth_opp = down_depth if fav_side == "Up" else up_depth
                 entry = _resolve_entry(
@@ -1873,6 +1954,8 @@ async def _run_one_cycle(
                     label, sig = entry
                     logger.info(f"*** ENTRY SIGNAL *** {label}")
                     success = await engine.enter(market, sig, config)
+                    if threshold_state is not None:
+                        threshold_state["since"] = None
                     if success:
                         logger.info("Entry successful -- switching to stop-loss monitor")
                         if notifier:
@@ -1886,6 +1969,15 @@ async def _run_one_cycle(
                         return
                     else:
                         logger.error("Entry failed -- will retry next tick")
+            else:
+                # Price dropped below threshold in hot zone — reset timer
+                if threshold_state and threshold_state.get("since") is not None:
+                    held = time.monotonic() - threshold_state["since"]
+                    logger.info(
+                        f"[{config.strategy.value}] Price dropped below threshold "
+                        f"after {held:.0f}s — resetting hold timer"
+                    )
+                    threshold_state["since"] = None
 
         await _interruptible_sleep(HOT_POLL_INTERVAL, shutdown_event)
 
@@ -1921,6 +2013,9 @@ async def _run_strategy(
         ),
     )
 
+    # Persistence timer for entry_hold_secs filter (only used when entry_hold_secs > 0)
+    threshold_state: Optional[dict] = {"since": None} if config.entry_hold_secs > 0 else None
+
     async with aiohttp.ClientSession() as session:
         notifier.set_session(session)
         await notifier.notify_startup(config)
@@ -1929,7 +2024,7 @@ async def _run_strategy(
             try:
                 await _run_one_cycle(
                     engine, session, clob_client, config, strategy_logger,
-                    shutdown_event, notifier,
+                    shutdown_event, notifier, threshold_state=threshold_state,
                 )
                 await notifier.maybe_heartbeat(None, engine)
             except Exception as e:
